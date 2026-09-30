@@ -1,0 +1,1073 @@
+---
+title: "Shot predictor"
+author: "Augustin de Menibus"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Data Exploration:
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(rsample)
+library(recipes)
+library(caret)
+library(ranger)
+library(xgboost)
+library(neuralnet)
+library(nnet)
+
+NBAshots <- read.csv("training.csv.gz")
+
+str(NBAshots)
+
+summary(NBAshots)
+
+## How many values are missing in each column:
+sort(colSums(is.na(NBAshots)),decreasing = TRUE)
+
+```
+
+## Necessary Data Transformation: Part 1: Shot type and Game state
+
+These transformations only look one row at a time, or one shot a time. They are not learning from other rows so there is no information leakage between folds and are safe to run before the split.
+
+
+```{r}
+## We will make a copy df so we have a baseline to compare our data transformation to:
+
+NBAshots_train = NBAshots
+
+
+## Convert strings into categories for our model to learn different relationships for different categories:
+NBAshots_train$gamestate = factor(NBAshots_train$gamestate, ordered = FALSE )
+## There are different game states, therefore game state has distinct categories with no rankings. That is why we turn it into factors so the model can develop relationship per category.
+
+NBAshots_train$shottype = factor(NBAshots_train$shottype, ordered = FALSE)
+## The logic is the same as with game state, we are making none ranked categories that will be fed to our model.
+
+## We will now analyze the actual categories and the frequencies that we have in our data set from game state and shot type
+table(NBAshots_train$gamestate, useNA = "ifany")
+table(NBAshots_train$shottype, useNA = "ifany")
+
+Shotmadepertype <- tapply(NBAshots_train$outcome == 1 , NBAshots_train$shottype, mean, na.rm =TRUE)
+Shotmadepertype
+
+Shotmadepergamestate <- tapply(NBAshots_train$outcome == 1 , NBAshots_train$gamestate, mean, 
+                               na.rm = TRUE) 
+Shotmadepergamestate
+
+## We notice clear patterns, shots that are closer to the basket are more likely to go in, this makes sense as they are simpler shots that have a higher probability of going in.
+```
+
+## Necessary Data Transformation 2: Defender approach transformation:
+
+```{r}
+
+# Remove braces and split each shot's text at the commas
+approach_text = gsub("[{}]", "", NBAshots_train$closestdefapproach)
+approach_list = strsplit(approach_text, ",", fixed = TRUE)
+
+# Convert each shot's four values into numbers
+parse_distances = function(x) {
+  if (length(x) == 1L && is.na(x)) return(rep(NA_real_, 4L))
+
+  if (length(x) != 4L) {
+    stop("A shot does not contain four approach values.")
+  }
+
+  x = trimws(x)
+  missing_value = is.na(x) | x %in% c("", "NA", "NULL", "null")
+  values = suppressWarnings(as.numeric(x))
+
+  if (any(!missing_value & !is.finite(values))) {
+    stop("An approach value is not a valid number.")
+  }
+
+  values[missing_value] = NA_real_
+  values
+}
+
+# Process every shot and arrange the results into rows
+approach_matrix = t(
+  vapply(approach_list, parse_distances, numeric(4))
+)
+
+# Name the four columns by seconds before release
+approach_names = c(
+  "defdist_1s",
+  "defdist_075s",
+  "defdist_05s",
+  "defdist_025s"
+)
+
+# Add the columns to working data
+NBAshots_train[approach_names] = as.data.frame(approach_matrix)
+
+NBAshots_train$closestdefapproach = NULL
+
+```
+
+
+## Distribution and Variance Exploration: 
+### Making the plotting function
+```{r}
+## We will now examine interesting distributions:
+
+shots <- NBAshots_train
+
+makesummary = function(shots, ...) {
+  shots %>%
+    group_by(...) %>%
+    summarise(
+      attempts = n(),
+      knownoutcomes = sum(!is.na(outcome)),
+      makes = sum(outcome == 1, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      make_pct = if_else(
+        knownoutcomes > 0,
+        100 * makes / knownoutcomes,
+        NA_real_
+      )
+    )
+}
+
+plot_rates = function(summarytable, variable, axis_label, plot_title) {
+
+  ggplot(
+    summarytable,
+    aes(x = .data[[variable]], y = make_pct)
+  ) +
+    geom_col(fill = "firebrick", width = 0.7) +
+    geom_text(
+      aes(label = sprintf("%.1f%%", make_pct)),
+      nudge_y = 2,
+      vjust = 0,
+      size = 3
+    ) +
+    scale_y_continuous(
+      limits = c(0, 110),
+      breaks = seq(0, 100, 25),
+      labels = function(x) paste0(x, "%")
+    ) +
+    labs(
+      title = plot_title,
+      x = axis_label,
+      y = "Make percentage",
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 35, hjust = 1)
+    )
+}
+```
+
+### Visualizations part 1: Shot type and Game context: 
+```{r}
+# 1. Make percentage by shot type
+library(ggplot2)
+type_summary = makesummary(shots, shottype)
+
+print(type_summary)
+
+print(
+  plot_rates(
+    type_summary,
+    "shottype",
+    "Shot type",
+    "Make percentage by shot type"
+  )
+)
+
+
+# 2. Make percentage by game state
+
+state_summary = makesummary(shots, gamestate)
+
+print(state_summary)
+
+print(
+  plot_rates(
+    state_summary,
+    "gamestate",
+    "Game state",
+    "Make percentage by game state"
+  )
+)
+
+
+# 3. Make percentage for two versus three point attempts
+
+# Add readable labels while preserving the original three column
+shots$point_value = factor(
+  shots$three,
+  levels = c(0, 1),
+  labels = c("2 point", "3 point")
+)
+
+three_summary = makesummary(shots, point_value)
+
+print(three_summary)
+
+print(
+  plot_rates(
+    three_summary,
+    "point_value",
+    "Point value",
+    "Make percentage for two and three point attempts"
+  )
+)
+```
+
+### Interpretation: 
+We can see clear trends for the probability of a shot going in and the type of shot taken. We previously touched on this trend before, the bar graph confirms our initial hypothesis. Furthermore, we see the difference in probability of success also depend on the state of the game and if the shot is 2 or 3 pointer. 
+
+## Visualization part 2: Shot distance, location and time: 
+```{r}
+# Visual 4: Make percentage by distance from the basket
+
+shots$distance_band = cut(
+  shots$distance,
+  breaks = c(0, 3, 8, 16, 24, 30, Inf),
+  include.lowest = TRUE
+)
+
+distance_summary = makesummary(shots, distance_band)
+
+print(distance_summary)
+
+print(
+  plot_rates(
+    distance_summary,
+    "distance_band",
+    "Distance from basket in feet",
+    "Make percentage by shot distance"
+  )
+)
+
+# Visual 5: Make percentage by shot clock interval
+
+shots$shotclock_band = cut(
+  shots$shotclock,
+  breaks = c(0, 4, 8, 12, 16, 20, 24),
+  include.lowest = TRUE
+)
+
+clock_summary = makesummary(shots, shotclock_band)
+
+print(clock_summary)
+
+print(
+  plot_rates(
+    clock_summary,
+    "shotclock_band",
+    "Seconds remaining on the shot clock",
+    "Make percentage by shot clock interval"
+  )
+)
+
+
+```
+
+### Interpretation: 
+Firstly, the variable of distance has a clear negative relationship with the probability of a shot being scored. As we get further from the basket it becomes more difficult to make shots. Secondly, we see a positive relationship between the probability of a shot being scored and the time left on the shot clock, the more time is left the more shots have been scored. A possible explanation could be that players are less rushed and stressed when shooting early in the shot clock.
+
+## Visualization Part 3: Defensive pressure and movement
+```{r}
+# Visual 6: Make percentage by number of contesters
+
+shots$contester_group <- factor(
+  shots$num_contesters,
+  levels = 0:4
+)
+
+contester_summary = makesummary(shots, contester_group)
+
+print(contester_summary)
+
+visual6 = plot_rates(
+  contester_summary,
+  "contester_group",
+  "Number of contesters",
+  "Visual 6: Make percentage by number of contesters"
+)
+
+print(visual6)
+
+
+# Visual 7: Make percentage by closest defender distance
+
+shots$defender_band = cut(
+  shots$closestdefdist,
+  breaks = c(0, 2, 4, 6, 10, Inf),
+  include.lowest = TRUE
+)
+
+defender_summary = makesummary(shots, defender_band)
+
+print(defender_summary)
+
+visual7 = plot_rates(
+  defender_summary,
+  "defender_band",
+  "Closest defender distance in feet",
+  "Visual 7: Make percentage by closest defender distance"
+)
+
+print(visual7)
+
+
+```
+
+### Interpretation
+There is a clear negative relationship between make percentage and number of contesters. As the number of contesters increases, the make percentage decreases. This seems logical as more defensive players increase the opportunity of blocks or slight alterations to jump shot trajectory. The position of the closest defender doesn't have a clear impact on shooting percentages. Interestingly, when defenders are in between 2 and 4 feet from the offensive player, NBA shots have the highest percentage of going in.
+
+
+
+## Model part 1: Data Split + Folds
+```{r}
+## Create five fold cross validation for our models:
+predictors = c("num_contesters",
+               "distcont1", "distcont2", "distcont3", "distcont4",
+               "contested", "gamestate", "shottype",
+               "distance","locationx", "locationy",
+               "three", "dribblesbefore", "shotclock",
+               "closestdefdist", "shooterspeed",
+               "defdist_1s", "defdist_075s",
+               "defdist_05s","defdist_025s",
+               "month","season_id")
+## We define the original predictors given to us
+
+modeldata <- shots %>%
+  select(outcome, shooter_id, closestdef_id, all_of(predictors)) %>%
+  filter(!is.na(outcome)) %>%
+  mutate(
+    across(where(is.factor), as.character),
+    contested = as.integer(contested),
+    three = as.integer(three),
+    season_id = as.character(season_id),
+    month = as.character(month),
+    .stratum = factor(outcome)
+  )
+
+## We make our initial split reproducible
+set.seed(12345)
+
+outersplit <- initial_split(
+  modeldata,
+  prop = 0.8,
+  strata = .stratum)
+
+development <- training(outersplit)
+holdoutdata <- testing(outersplit)
+
+## Now we create validation folds within our development data
+set.seed(678)
+v=5 
+folds = vfold_cv(
+  development,
+  v=v,
+  strata = .stratum
+)
+
+
+```
+
+
+## Model Part 2: Preprocessing 
+```{r}
+
+## We need to clean our contester columns data as it holds N/A values:
+contestercolumns = c("distcont1", "distcont2", "distcont3", "distcont4")
+defendercolumns = c("closestdefdist", approach_names, contestercolumns)
+continuouscolumns = c("num_contesters", defendercolumns, "distance", "locationx",
+                      "locationy", "dribblesbefore", "shotclock", "shooterspeed",
+                      "closingspeed", "defenderspace")
+## We must ensure that outcome and identifiers are not used as predictors, if not our model won't be accurate:
+stopifnot(!any(c("outcome",".stratum","shot_id")%in% predictors))
+
+## We need to store our cleaned data for every fold: 
+
+folddata = list()
+
+for(i in seq_len(nrow(folds))) {
+  trainingdata = analysis(folds$splits[[i]])
+  validationdata = assessment(folds$splits[[i]])
+  ## Select predictors:
+  traininginputs = trainingdata[, predictors, drop = FALSE]
+  validationinputs = validationdata[, predictors, drop = FALSE]
+  ## We make sure the categories exist:
+  stopifnot("tip" %in% traininginputs$shottype,
+            "TRANSITION" %in% traininginputs$gamestate)
+  ##Preprocessing
+  nbarecipe = recipe(~ ., data = traininginputs) %>%
+    ## Categories that were not observed
+    step_novel(all_nominal_predictors()) %>%
+    ## Handle missing categorical values
+    step_unknown(all_nominal_predictors()) %>%
+    ## Set our reference categories:
+    step_relevel(shottype, ref_level = "dunk") %>%
+    step_relevel(gamestate, ref_level = "HALFCOURT") %>%
+    step_mutate(across(all_of(defendercolumns), ~ coalesce(.x, distance))) %>%
+    ## We choose to substitute N/A values with the distance of the actual shot
+    step_impute_median(all_numeric_predictors()) %>%
+    step_dummy(all_nominal_predictors(), one_hot = FALSE) %>%
+    ## Remove columns that don't have any variance as they don't help our predictions
+    step_zv(all_predictors()) %>%
+    # Temporarily represent the intercept using a column of ones
+    step_mutate(glm_constant = 1) %>%
+
+# Identify and remove exactly redundant columns
+   step_lincomb(glm_constant, all_numeric_predictors()) %>%
+  step_rm(glm_constant) %>%
+  step_normalize(any_of(continuouscolumns))
+
+  ## Learn from the preprocessing
+  preprocessor = prep(nbarecipe, training = traininginputs, retain = FALSE)
+  ## We need to apply rules:
+  xtrain = bake(preprocessor, new_data = traininginputs, composition = "matrix")
+  xvalid = bake(preprocessor, new_data = validationinputs, composition = "matrix")
+ 
+   ## Make sure we don't have missing values or infinite values that would create an error:
+  stopifnot( ncol(xtrain) > 0,
+             all(is.finite(xtrain)),
+             all(is.finite(xvalid)),
+             identical(colnames(xtrain),colnames(xvalid)))
+  
+  folddata[[i]] = list(
+    xtrain = xtrain,
+    ytrain = trainingdata$outcome,
+    xvalid = xvalid,
+    yvalid = validationdata$outcome,
+    preprocessor = preprocessor
+  )
+  
+}
+
+aboveexpected = function(groups, above, newgroups, m = 100) {
+  sums = tapply(above, groups, sum)
+  counts = tapply(above, groups, length)
+  rates = sums / (counts + m)
+  out = unname(rates[as.character(newgroups)])
+  out[is.na(out)] = 0          # a player never seen in training is treated as average
+  out
+}
+
+## Training rows out of fold, so a shot never "sees" its own outcome
+aboveexpectedoof = function(groups, above, m = 100, k = 5, seed = 1) {
+  set.seed(seed)
+  innerfold = sample(rep(1:k, length.out = length(above)))
+  out = numeric(length(above))
+  for (j in 1:k) {
+    inside = innerfold == j
+    out[inside] = aboveexpected(groups[!inside], above[!inside], groups[inside], m)
+  }
+  out
+}
+
+## Shot zone, so a player can be good at the rim and bad from three
+shotzone = function(data) {
+  ifelse(data$three == 1, "three", ifelse(data$distance < 8, "close", "mid"))
+}
+
+playercolumns = c("shooterabove", "shooterzoneabove", "defenderabove")
+oldplayercolumns = c("shooterrate", "shooter3rate", "defenderrate")
+
+for (i in seq_along(folddata)) {
+  trainingdata = analysis(folds$splits[[i]])
+  validationdata = assessment(folds$splits[[i]])
+  y = trainingdata$outcome
+
+  ## Shot columns only (no player columns)
+  shotcolumns = !colnames(folddata[[i]]$xtrain) %in% c(playercolumns, oldplayercolumns)
+  xtrain = folddata[[i]]$xtrain[, shotcolumns]
+  xvalid = folddata[[i]]$xvalid[, shotcolumns]
+
+  ## 1) Expected make probability of each training shot (glm.fit = fast matrix glm)
+  expectedmodel = glm.fit(x = cbind(1, xtrain), y = y, family = binomial())
+  expectedcoef = expectedmodel$coefficients
+  expectedcoef[is.na(expectedcoef)] = 0
+  expectedprobability = plogis(drop(cbind(1, xtrain) %*% expectedcoef))
+
+  ## 2) Actual minus expected (+0.6 = made a 40% shot)
+  above = y - expectedprobability
+
+  ## 3) Average per shooter, per shooter and zone, and per closest defender
+  trainfeatures = cbind(
+    shooterabove     = aboveexpectedoof(trainingdata$shooter_id, above, seed = i),
+    shooterzoneabove = aboveexpectedoof(paste(trainingdata$shooter_id, shotzone(trainingdata)), above, seed = i),
+    defenderabove    = aboveexpectedoof(trainingdata$closestdef_id, above, seed = i)
+  )
+  validfeatures = cbind(
+    shooterabove     = aboveexpected(trainingdata$shooter_id, above, validationdata$shooter_id),
+    shooterzoneabove = aboveexpected(paste(trainingdata$shooter_id, shotzone(trainingdata)), above,
+                                     paste(validationdata$shooter_id, shotzone(validationdata))),
+    defenderabove    = aboveexpected(trainingdata$closestdef_id, above, validationdata$closestdef_id)
+  )
+
+  folddata[[i]]$xtrain = cbind(xtrain, trainfeatures)
+  folddata[[i]]$xvalid = cbind(xvalid, validfeatures)
+
+  stopifnot(all(is.finite(folddata[[i]]$xtrain)),
+            all(is.finite(folddata[[i]]$xvalid)),
+            identical(colnames(folddata[[i]]$xtrain), colnames(folddata[[i]]$xvalid)))
+}
+
+summary(folddata[[1]]$xvalid[, playercolumns])
+
+
+```
+
+
+
+
+
+## Basic Logistic Regression + log loss:
+
+```{r}
+## We are making a function to give a log loss score to our models:
+logloss = function(actual, probability, eps = 1e-15) {
+  probability = pmin(pmax(probability, eps), 1 - eps)
+  -mean(actual * log(probability) + (1 - actual) * log(1 - probability))
+}
+
+## Now we pit our model against a baseline:
+oof_glm = rep(NA_real_,
+              nrow(development))
+              fold_loss_glm =
+                numeric(length(folddata))
+              
+for (i in seq_along(folddata)) {
+ trainingglm = 
+   as.data.frame(folddata[[i]]$xtrain)
+ trainingglm$outcome =
+   folddata[[i]]$ytrain
+ validationglm = 
+   as.data.frame(folddata[[i]]$xvalid)
+
+ simplemodel = glm(outcome ~ ., data = trainingglm,
+                   family = binomial(link = "logit"))
+ shotprobability = predict(simplemodel, newdata = validationglm,
+                           type = "response")
+ validationrows = complement(folds$splits[[i]])
+ oof_glm[validationrows] = shotprobability
+ fold_loss_glm[i] = logloss(folddata[[i]]$yvalid, shotprobability)
+}
+
+              
+stopifnot(!anyNA(oof_glm))
+## We map the log loss per fold
+fold_loss_glm
+## Overall log loss of our model
+logloss(development$outcome,oof_glm)
+
+## The base line, which predicts the mean for every shot: 
+baselineprobability = rep(mean(development$outcome), nrow(development))
+logloss(development$outcome, baselineprobability)
+
+summary(folddata[[1]]$xvalid[, playercolumns]) 
+```
+
+In terms of log loss, our logistic model performs slightly better than guessing the mean of every shot. We will now move on to other models to see if we can increase our performance. 
+
+Even after the inclusion of shooters and their percentages, we see no increase in our guessing accuracy, as their coefficients are near 0.
+
+## Random Forest model:
+
+```{r}
+
+## We are putting one prediction per shot, on a data set the model has never seen
+oof_rf = rep(NA_real_, nrow(development))
+foldloglossrf = numeric(length(folddata))
+
+
+for (i in seq_along(folddata)) {
+  rfmodel = ranger(
+    x = folddata[[i]]$xtrain,
+    y = factor(folddata[[i]]$ytrain, levels = c(0, 1)),
+    probability = TRUE,
+    num.trees = 300,
+    min.node.size = 50,
+    seed = 100 + i
+  )
+
+  ## We choose bigger node sizes for smoother and less overconfident probabilities which could hurt our performance.
+  
+  shotprobability = predict(rfmodel, data = folddata[[i]]$xvalid)$predictions[, "1"]
+
+  oof_rf[complement(folds$splits[[i]])] = shotprobability
+  foldloglossrf[i] = logloss(folddata[[i]]$yvalid, shotprobability)
+}
+
+stopifnot(!anyNA(oof_rf))
+foldloglossrf
+logloss(development$outcome, oof_rf)
+cor(oof_glm, oof_rf)
+## We look at the correlation of our models to see how different our predictions since we aim to build a stacked model
+
+
+```
+
+Our random forest model predicts better than our simple logistic regression, scoring 0.63 on the log loss against a 0.64, all five random forest folds relatively agree on predictions.
+
+The correlation of 0.87 means both models agree on most shots but not all.
+
+We will now move on to our third model, the XGboost
+
+## XGboost Model:
+```{r}
+## We follow the same procedure as before:
+
+xgbparams = list(
+  objective = "binary:logistic", ## Make our output a probability
+  eval_metric = "logloss",
+  eta = 0.02, ## We make our learning rate slow to avoid overconfidence
+  max_depth = 6, ## We don't want the model to memorize the data 
+  min_child_weight = 100, ## No leaf built on a handful of shots
+  subsample = 0.8, ## We follow our 80:20 split
+  colsample_bytree = 0.8
+)
+
+evalsname = "evals"
+
+oof_XG = rep(NA_real_, nrow(development))
+foldloglossXG = numeric(length(folddata))
+bestroundsXG = numeric(length(folddata))
+
+
+for (i in seq_along(folddata)) {
+  xtrain = folddata[[i]]$xtrain
+  ytrain = folddata[[i]]$ytrain
+  set.seed(200 + i)
+  stoprows = sample(nrow(xtrain), round(0.1 * nrow(xtrain)))
+  fitdata  = xgb.DMatrix(xtrain[-stoprows, ], label = ytrain[-stoprows])
+  stopdata = xgb.DMatrix(xtrain[stoprows, ],  label = ytrain[stoprows])
+
+  trainargs = list(params = xgbparams, data = fitdata, nrounds = 3000,
+                   early_stopping_rounds = 50, verbose = 0)
+  trainargs[[evalsname]] = list(stop = stopdata)
+  tunemodel = do.call(xgb.train, trainargs)
+
+  ## Number of trees with the lowest log loss on the set-aside shots to learn on it
+  evallog = attributes(tunemodel)$evaluation_log
+  if (is.null(evallog)) evallog = tunemodel$evaluation_log
+  stopifnot(!is.null(evallog))
+  bestroundsXG[i] = which.min(evallog[[2]])
+
+  ## Retrain on all of this fold's training shots with that many trees
+  xgbmodel = xgb.train(params = xgbparams, data = xgb.DMatrix(xtrain, label = ytrain),
+                       nrounds = bestroundsXG[i], verbose = 0)
+
+  shotprobability = predict(xgbmodel, xgb.DMatrix(folddata[[i]]$xvalid))
+
+  ## Put each fold's predictions back in the rows they came from
+  oof_XG[complement(folds$splits[[i]])] = shotprobability
+  foldloglossXG[i] = logloss(folddata[[i]]$yvalid, shotprobability)
+}
+
+stopifnot(!anyNA(oof_XG))
+bestroundsXG
+foldloglossXG
+logloss(development$outcome,oof_XG)
+cor(cbind(oof_glm,oof_rf,oof_XG))
+```
+
+We achieve a log loss of 0.6234 on our XGBoost. We will now move on to the neural network:
+
+
+## Neural Network:
+```{r}
+oof_nn = rep(NA_real_, nrow(development))
+foldloglossnn = numeric(length(folddata))
+
+for(i in seq_along(folddata)) {
+  xtrain = folddata[[i]]$xtrain
+  xvalid = folddata[[i]]$xvalid
+  ## We have to put everything on the same scale for this model:
+  centers = colMeans(xtrain)
+  scales = apply(xtrain, 2, sd)
+  scales[scales == 0] = 1
+  xtrainn = scale(xtrain, center = centers, scale = scales)
+  xvalidnn = scale(xvalid, center = centers, scale = scales)
+  
+  set.seed(400 +i)
+  nnmodel = nnet(
+    x = xtrainn,
+    y = folddata[[i]]$ytrain,
+    size = 10,
+    decay = 10, ## Strong penalty for strong predictions
+    entropy = TRUE, ## We are training on log loss
+    maxit = 300,
+    rang = 0.1,
+    MaxNWts = 5000,
+    trace = FALSE
+    
+  )
+  shotprobability = as.vector(predict(nnmodel, xvalidnn))
+  
+  oof_nn[complement(folds$splits[[i]])] = shotprobability
+  foldloglossnn[i] = logloss(folddata[[i]]$yvalid, shotprobability)
+}
+
+stopifnot(!anyNA(oof_nn))
+foldloglossnn
+logloss(development$outcome,oof_nn)
+cor(cbind(oof_glm,oof_rf,oof_XG,oof_nn))
+          
+```
+
+
+Now we can make a stacked model to see if we are able to achieve a better log loss:
+
+## Stacked model:
+```{r}
+
+normalization = function(p)
+  qlogis(pmin(pmax(p, 0.001), 0.999))
+
+stackdata = data.frame( predglm = normalization(oof_glm),
+                        predrf = normalization(oof_rf),
+                        predxgb = normalization(oof_XG),
+                        prednn = normalization(oof_nn),
+                        outcome = development$outcome)
+stopifnot(!anyNA(stackdata))
+
+oofstack = rep(NA_real_,nrow(development))
+foldloglossstack = numeric(length(folddata))
+## Score the stacks honestly and predict the 5th one
+
+for(i in seq_along(folddata)){
+  validationrows =
+    complement(folds$splits[[i]])
+  stackmodel = glm(outcome ~ predglm + predrf + predxgb + prednn,
+                   data = stackdata[-validationrows, ],
+                   family = binomial())
+  shotprobability = predict(stackmodel, newdata = stackdata[validationrows, ],
+                            type = "response")
+  oofstack[validationrows] = shotprobability
+  foldloglossstack[i] = logloss(development$outcome[validationrows], shotprobability)
+}
+## We follow the same exact method we have being doing all along but this time the data are the outputs given by all the different models
+stopifnot(!anyNA(oofstack))
+foldloglossstack
+logloss(development$outcome, oofstack)
+logloss(development$outcome, oof_XG)
+
+```
+
+We achieve only a slightly better log loss, this is probably due to the fact that the stacked model consistently chooses the XGboost, thus achieving a similar score to it. Now that we have trained our models on all folds. We will move on to training it on the 80% split without any folds.
+
+## 1) Preprocessing: We redo our preprocessing for the development data
+```{r}
+stopifnot(exists("nbarecipe"),
+          exists("aboveexpectedoof"),
+          exists("shotzone"),
+          exists("xgbparams"),
+          exists("stackdata"),
+          exists("normalization"))
+## We move on to cleaning the development shots:
+developmentinputs = development[, predictors, drop = FALSE]
+holdoutinputs = holdoutdata[, predictors, drop = FALSE]
+## We follow the same process as before but not on folds but rather the overall 80% training data:
+
+finalpreprocessor = prep(nbarecipe, training = developmentinputs, retain = FALSE)
+xdevelopment = bake(finalpreprocessor, new_data = developmentinputs, composition = "matrix")
+xholdout = bake(finalpreprocessor, new_data = holdoutinputs, composition = "matrix")
+
+stopifnot(all(is.finite(xdevelopment)), all(is.finite(xholdout)),
+          identical(colnames(xdevelopment), colnames(xholdout)),
+          nrow(xdevelopment) == nrow(development), nrow(xholdout) == nrow(holdoutdata))
+
+```
+
+## 2) Player columns: Expected makes using a glm
+```{r}
+ydevelopment = development$outcome
+## We build a model to quantify the difficulties of shots so our model can predict better:
+expectedmodel = glm.fit(x = cbind(1, xdevelopment), y = ydevelopment, family = binomial())
+expectedcoef = expectedmodel$coefficients
+expectedcoef[is.na(expectedcoef)] = 0
+above = ydevelopment - plogis(drop(cbind(1, xdevelopment) %*% expectedcoef))
+stopifnot(is.numeric(above), length(above) == nrow(development))
+
+## We average the shooters and see how well they shoot above their average, we do the same for zone and defender
+
+developmentplayers = cbind(
+  shooterabove     = aboveexpectedoof(development$shooter_id, above, seed = 99),
+  shooterzoneabove = aboveexpectedoof(paste(development$shooter_id, shotzone(development)), above, seed = 99),
+  defenderabove    = aboveexpectedoof(development$closestdef_id, above, seed = 99)
+)
+holdoutplayers = cbind(
+  shooterabove     = aboveexpected(development$shooter_id, above, holdoutdata$shooter_id),
+  shooterzoneabove = aboveexpected(paste(development$shooter_id, shotzone(development)), above,
+                                   paste(holdoutdata$shooter_id, shotzone(holdoutdata))),
+  defenderabove    = aboveexpected(development$closestdef_id, above, holdoutdata$closestdef_id)
+)
+
+## We match the players to their 
+stopifnot(nrow(developmentplayers) == nrow(development), nrow(holdoutplayers) == nrow(holdoutdata))
+
+xdevelopment = cbind(xdevelopment, developmentplayers)
+xholdout = cbind(xholdout, holdoutplayers)
+stopifnot(all(is.finite(xdevelopment)), all(is.finite(xholdout)),
+          identical(colnames(xdevelopment), colnames(xholdout)))
+```
+
+## 3) We refit our models on the 80% of data:
+### 1) Logistic regression: 
+```{r}
+## Logistic regression, we run the same model on the 80% now:
+trainingglm = as.data.frame(xdevelopment)
+trainingglm$outcome = ydevelopment
+finalglm = glm(outcome ~ ., data = trainingglm, family = binomial(link = "logit"))
+holdoutglm = predict(finalglm, newdata = as.data.frame(xholdout), type = "response")
+
+```
+
+### 2) Random Forest:
+```{r}
+## We run our random forest on the 80%:
+finalrf = ranger(x = xdevelopment, y = factor(ydevelopment, levels = c(0, 1)),
+                 probability = TRUE, num.trees = 300, min.node.size = 50, seed = 100)
+holdoutrf = predict(finalrf, data = xholdout)$predictions[, "1"]
+```
+
+### 3) XGboost: 
+```{r}
+## We run our XGboost on the 80% training data, the number of trees is from a 10% stop slice, then we refit on development shots
+set.seed(500)
+stoprows = sample(nrow(xdevelopment), round(0.1 * nrow(xdevelopment)))
+fitdata = xgb.DMatrix(xdevelopment[-stoprows, ], label = ydevelopment[-stoprows])
+stopdata = xgb.DMatrix(xdevelopment[stoprows, ], label = ydevelopment[stoprows])
+trainargs = list(params = xgbparams, data = fitdata, nrounds = 3000,
+                 early_stopping_rounds = 50, verbose = 0)
+trainargs[[evalsname]] = list(stop = stopdata)
+tunemodel = do.call(xgb.train, trainargs)
+evallog = attributes(tunemodel)$evaluation_log
+if (is.null(evallog)) evallog = tunemodel$evaluation_log
+stopifnot(!is.null(evallog))
+bestroundsfinal = which.min(evallog[[2]])
+finalxgb = xgb.train(params = xgbparams, data = xgb.DMatrix(xdevelopment, label = ydevelopment),
+                     nrounds = bestroundsfinal, verbose = 0)
+holdoutxgb = predict(finalxgb, xgb.DMatrix(xholdout))
+```
+
+### 4) Neural Network
+```{r}
+## We run our neural network on the data scaled with the development shots mean and sd:
+centers = colMeans(xdevelopment)
+scales = apply(xdevelopment, 2, sd)
+scales[scales == 0] = 1
+set.seed(400)
+finalnn = nnet(x = scale(xdevelopment, center = centers, scale = scales), y = ydevelopment,
+               size = 10, decay = 10, entropy = TRUE, maxit = 300, rang = 0.1,
+               MaxNWts = 5000, trace = FALSE)
+holdoutnn = as.vector(predict(finalnn, scale(xholdout, center = centers, scale = scales)))
+
+stopifnot(!anyNA(holdoutglm), !anyNA(holdoutrf), !anyNA(holdoutxgb), !anyNA(holdoutnn))
+```
+
+### 5) Stacked Model: 
+```{r}
+## We run a logistic regression on all the development shots out of fold and applied to holdout:
+finalstack = glm(outcome ~ predglm + predrf + predxgb + prednn,
+                 data = stackdata, family = binomial())
+holdoutstackdata = data.frame(predglm = normalization(holdoutglm),
+                              predrf  = normalization(holdoutrf),
+                              predxgb = normalization(holdoutxgb),
+                              prednn  = normalization(holdoutnn))
+holdoutstack = predict(finalstack, newdata = holdoutstackdata, type = "response")
+stopifnot(!anyNA(holdoutstack), length(holdoutstack) == nrow(holdoutdata))
+
+```
+
+## Our final scores:
+```{r}
+yholdout = holdoutdata$outcome
+logloss(yholdout, holdoutstack)                               
+logloss(yholdout, rep(mean(ydevelopment), length(yholdout)))   # "no model" baseline
+
+## Each base model on the holdout, for comparison only (the choice is already made)
+c(glm = logloss(yholdout, holdoutglm), rf = logloss(yholdout, holdoutrf),
+  xgb = logloss(yholdout, holdoutxgb), nn = logloss(yholdout, holdoutnn))
+
+## How much the stacker trusts each model
+coef(finalstack)
+```
+
+We will now rerun the same process on the entirety of our training data before giving our probabilities in the test.csv.gz:
+
+## 1) Preprocess it again: Clean the testing shots + training shots too 
+
+```{r}
+stopifnot(exists("nbarecipe"), exists("aboveexpectedoof"), exists("shotzone"), exists("xgbparams"),
+          exists("finalstack"), exists("normalization"), exists("parse_distances"), exists("modeldata"))
+
+## Testing shots: the same row-by-row cleaning as training.csv.gz (nothing is learned here)
+testingraw = read.csv("testing.csv.gz", colClasses = c(shot_id = "character"))
+testingraw$gamestate = factor(testingraw$gamestate, ordered = FALSE)
+testingraw$shottype = factor(testingraw$shottype, ordered = FALSE)
+testingapproach = strsplit(gsub("[{}]", "", testingraw$closestdefapproach), ",", fixed = TRUE)
+testingraw[approach_names] = as.data.frame(t(vapply(testingapproach, parse_distances, numeric(4))))
+testingraw$closestdefapproach = NULL
+
+testingdata = testingraw %>%
+  select(shot_id, shooter_id, closestdef_id, all_of(predictors)) %>%
+  mutate(
+    across(where(is.factor), as.character),
+    contested = as.integer(contested),
+    three = as.integer(three),
+    season_id = as.character(season_id),
+    month = as.character(month)
+  )
+stopifnot(nrow(testingdata) == nrow(testingraw),
+          identical(sapply(testingdata[predictors], is.numeric), sapply(modeldata[predictors], is.numeric)))
+
+## Cleaning learned on ALL training shots (modeldata = development + holdout), applied to the testing shots
+allinputs = modeldata[, predictors, drop = FALSE]
+testinginputs = testingdata[, predictors, drop = FALSE]
+allpreprocessor = prep(nbarecipe, training = allinputs, retain = FALSE)
+xall = bake(allpreprocessor, new_data = allinputs, composition = "matrix")
+xtesting = bake(allpreprocessor, new_data = testinginputs, composition = "matrix")
+yall = modeldata$outcome
+stopifnot(all(is.finite(xall)), all(is.finite(xtesting)),
+          identical(colnames(xall), colnames(xtesting)),
+          nrow(xall) == nrow(modeldata), nrow(xtesting) == nrow(testingdata))
+```
+
+## 2) Player columns from all training shots:
+```{r}
+expectedall = glm.fit(x = cbind(1, xall), y = yall, family = binomial())
+coefall = expectedall$coefficients
+coefall[is.na(coefall)] = 0
+aboveall = yall - plogis(drop(cbind(1, xall) %*% coefall))
+stopifnot(is.numeric(aboveall), length(aboveall) == nrow(modeldata))
+
+allplayers = cbind(
+  shooterabove     = aboveexpectedoof(modeldata$shooter_id, aboveall, seed = 99),
+  shooterzoneabove = aboveexpectedoof(paste(modeldata$shooter_id, shotzone(modeldata)), aboveall, seed = 99),
+  defenderabove    = aboveexpectedoof(modeldata$closestdef_id, aboveall, seed = 99)
+)
+testingplayers = cbind(
+  shooterabove     = aboveexpected(modeldata$shooter_id, aboveall, testingdata$shooter_id),
+  shooterzoneabove = aboveexpected(paste(modeldata$shooter_id, shotzone(modeldata)), aboveall,
+                                   paste(testingdata$shooter_id, shotzone(testingdata))),
+  defenderabove    = aboveexpected(modeldata$closestdef_id, aboveall, testingdata$closestdef_id)
+)
+stopifnot(nrow(allplayers) == nrow(modeldata), nrow(testingplayers) == nrow(testingdata))
+
+xall = cbind(xall, allplayers)
+xtesting = cbind(xtesting, testingplayers)
+stopifnot(all(is.finite(xall)), all(is.finite(xtesting)), identical(colnames(xall), colnames(xtesting)))
+```
+
+## 3) Models: 
+
+### 1) Logistic regression:
+```{r}
+trainingall = as.data.frame(xall)
+trainingall$outcome = yall
+glmall = glm(outcome ~ ., data = trainingall, family = binomial(link = "logit"))
+testingglm = predict(glmall, newdata = as.data.frame(xtesting), type = "response")
+```
+
+### 2) Random Forest
+```{r}
+rfall = ranger(x = xall, y = factor(yall, levels = c(0, 1)),
+               probability = TRUE, num.trees = 300, min.node.size = 50, seed = 100)
+testingrf = predict(rfall, data = xtesting)$predictions[, "1"]
+```
+
+### 3) XGboost:
+```{r}
+set.seed(500)
+stoprowsall = sample(nrow(xall), round(0.1 * nrow(xall)))
+fitdataall = xgb.DMatrix(xall[-stoprowsall, ], label = yall[-stoprowsall])
+stopdataall = xgb.DMatrix(xall[stoprowsall, ], label = yall[stoprowsall])
+trainargsall = list(params = xgbparams, data = fitdataall, nrounds = 3000,
+                    early_stopping_rounds = 50, verbose = 0)
+trainargsall[[evalsname]] = list(stop = stopdataall)
+tunemodelall = do.call(xgb.train, trainargsall)
+evallogall = attributes(tunemodelall)$evaluation_log
+if (is.null(evallogall)) evallogall = tunemodelall$evaluation_log
+stopifnot(!is.null(evallogall))
+bestroundsall = which.min(evallogall[[2]])
+xgball = xgb.train(params = xgbparams, data = xgb.DMatrix(xall, label = yall),
+                   nrounds = bestroundsall, verbose = 0)
+testingxgb = predict(xgball, xgb.DMatrix(xtesting))
+```
+
+
+### 4) Neural networks:
+```{r}
+centersall = colMeans(xall)
+scalesall = apply(xall, 2, sd)
+scalesall[scalesall == 0] = 1
+set.seed(400)
+nnall = nnet(x = scale(xall, center = centersall, scale = scalesall), y = yall,
+             size = 10, decay = 10, entropy = TRUE, maxit = 300, rang = 0.1,
+             MaxNWts = 5000, trace = FALSE)
+testingnn = as.vector(predict(nnall, scale(xtesting, center = centersall, scale = scalesall)))
+```
+
+### 5) Stack Model:
+```{r}
+stopifnot(!anyNA(testingglm), !anyNA(testingrf), !anyNA(testingxgb), !anyNA(testingnn))
+
+testingstackdata = data.frame(predglm = normalization(testingglm),
+                              predrf  = normalization(testingrf),
+                              predxgb = normalization(testingxgb),
+                              prednn  = normalization(testingnn))
+testingstack = predict(finalstack, newdata = testingstackdata, type = "response")
+stopifnot(!anyNA(testingstack), length(testingstack) == nrow(testingdata))
+summary(testingstack)
+mean(testingstack)  
+```
+
+
+## Last step: We will now save our predicted probabilities in submission csv:
+
+```{r}
+submission = read.csv("submission.csv", colClasses = c(shot_id = "character"))
+stopifnot(identical(names(submission), c("shot_id", "make_prob")),
+          nrow(submission) == nrow(testingdata),
+          all(submission$shot_id %in% testingdata$shot_id))
+submission$make_prob = round(testingstack[match(submission$shot_id, testingdata$shot_id)], 6)
+stopifnot(!anyNA(submission$make_prob), all(submission$make_prob > 0 & submission$make_prob < 1))
+write.csv(submission, "submission.csv", row.names = FALSE, quote = FALSE)
+
+```
+
+
+
+
+
+## Saving our results for RMD: 
+```{r}
+## Save what the write-up needs (very end of project_code.Rmd)
+stopifnot(exists("holdoutstack"), exists("finalstack"), exists("finalxgb"),
+          length(above) == nrow(development))
+numericcolumns = predictors[sapply(development[, predictors], is.numeric)]
+writeupdata = list(
+  shots = development[, c("outcome", "shottype", "distance", "locationx", "locationy",
+                          "three", "closestdefdist", "shooter_id")],
+  oof = data.frame(glm = oof_glm, rf = oof_rf, xgb = oof_XG, nn = oof_nn, stack = oofstack),
+  folds = data.frame(fold = seq_along(folddata), glm = fold_loss_glm, rf = foldloglossrf,
+                     xgb = foldloglossXG, nn = foldloglossnn, stack = foldloglossstack),
+  above = above,
+  importance = as.data.frame(xgb.importance(model = finalxgb)),
+  holdout = data.frame(outcome = holdoutdata$outcome, predicted = holdoutstack,
+                       glm = holdoutglm, rf = holdoutrf, xgb = holdoutxgb, nn = holdoutnn),
+  missing = sapply(shots[, predictors], function(x) mean(is.na(x))),
+  cormatrix = cor(development[, numericcolumns], use = "pairwise.complete.obs")
+)
+saveRDS(writeupdata, "writeupdata.rds")
+```
+
